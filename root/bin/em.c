@@ -48,13 +48,13 @@ uint verbose,    // chatty option -v
   trap,          // fault code
   ivec,          // interrupt vector
   vadr,          // bad virtual address
-  paging,        // virtual memory enabled
-  pdir,          // page directory
+  virtualMemoryEnabled,        // virtual memory enabled
+  pageDirectory,          // page directory
   tpage[TPAGES], // valid page translations
   tpages,        // number of cached page translations
-  *trk, *twk,    // kernel read/write page transation tables
-  *tru, *twu,    // user read/write page transation tables
-  *tr,  *tw;     // current read/write page transation tables
+  *kernelReadPageTable, *kernelWritePageTable,    // kernel read/write page transation tables
+  *userReadPageTable, *userWritePageTable,    // user read/write page transation tables
+  *currentReadPageTable,  *currentWritePageTable;     // current read/write page transation tables
 
 char *cmd;       // command name
 
@@ -75,7 +75,7 @@ void flush()
 //  if (verbose) printf("F(%d)",tpages);
   while (tpages) {
     v = tpage[--tpages];
-    trk[v] = twk[v] = tru[v] = twu[v] = 0;
+    kernelReadPageTable[v] = kernelWritePageTable[v] = userReadPageTable[v] = userWritePageTable[v] = 0;
   }
 }
 
@@ -83,15 +83,15 @@ uint setpage(uint v, uint p, uint writable, uint userable)
 {
   if (p >= memsz) { trap = FMEM; vadr = v; return 0; }
   p = ((v ^ (mem + p)) & -4096) + 1;
-  if (!trk[v >>= 12]) {
+  if (!kernelReadPageTable[v >>= 12]) {
     if (tpages >= TPAGES) flush();
     tpage[tpages++] = v;
   }
 //  if (verbose) printf(".");
-  trk[v] = p;
-  twk[v] = writable ? p : 0;
-  tru[v] = userable ? p : 0;
-  twu[v] = (userable && writable) ? p : 0;
+  kernelReadPageTable[v] = p;
+  kernelWritePageTable[v] = writable ? p : 0;
+  userReadPageTable[v] = userable ? p : 0;
+  userWritePageTable[v] = (userable && writable) ? p : 0;
   return p;
 }
 
@@ -99,8 +99,8 @@ uint rlook(uint v)
 {
   uint pde, *ppde, pte, *ppte, q, userable;
 //  dprintf(2,"rlook(%08x)\n",v);
-  if (!paging) return setpage(v, v, 1, 1);
-  pde = *(ppde = (uint *)(pdir + (v>>22<<2))); // page directory entry
+  if (!virtualMemoryEnabled) return setpage(v, v, 1, 1);
+  pde = *(ppde = (uint *)(pageDirectory + (v>>22<<2))); // page directory entry
   if (pde & PTE_P) {
     if (!(pde & PTE_A)) *ppde = pde | PTE_A;
     if (pde >= memsz) { trap = FMEM; vadr = v; return 0; }
@@ -119,8 +119,8 @@ uint wlook(uint v)
 {
   uint pde, *ppde, pte, *ppte, q, userable;
 //  dprintf(2,"wlook(%08x)\n",v);
-  if (!paging) return setpage(v, v, 1, 1);
-  pde = *(ppde = (uint *)(pdir + (v>>22<<2))); // page directory entry
+  if (!virtualMemoryEnabled) return setpage(v, v, 1, 1);
+  pde = *(ppde = (uint *)(pageDirectory + (v>>22<<2))); // page directory entry
   if (pde & PTE_P) {
     if (!(pde & PTE_A)) *ppde = pde | PTE_A;
     if (pde >= memsz) { trap = FMEM; vadr = v; return 0; }
@@ -180,9 +180,14 @@ static char *DBG_REG_CONTEX = "\n"
 
 void cpu(uint pc, uint sp)
 {
+  uint integerRegisterFile[3];
+  const int A = 0;
+  const int B = 1;
+  const int C = 2;
+
   uint a, b, c, ssp, usp, t, p, v, u, delta, cycle, xcycle, timer, timeout, fpc, tpc, xsp, tsp, fsp;
   double f, g;
-  int ir, *xpc, kbchar;
+  int immediate, *xpc, kbchar;
   char ch;
   struct pollfd pfd;
 
@@ -198,7 +203,7 @@ void cpu(uint pc, uint sp)
   goto fixpc;
 
 fixsp:
-  if ((p = tw[(v = xsp - tsp) >> 12])) {
+  if ((p = currentWritePageTable[(v = xsp - tsp) >> 12])) {
     tsp = (xsp = v ^ (p-1)) - v;
     fsp = (4096 - (xsp & 4095)) << 8;
   }
@@ -206,7 +211,7 @@ fixsp:
   for (;;) {
     if ((uint)xpc == fpc) {
 fixpc:
-      if (!(p = tr[(v = (uint)xpc - tpc) >> 12]) && !(p = rlook(v))) { trap = FIPAGE; goto exception; }
+      if (!(p = currentReadPageTable[(v = (uint)xpc - tpc) >> 12]) && !(p = rlook(v))) { trap = FIPAGE; goto exception; }
       xcycle -= tpc;
       xcycle += (tpc = (uint)(xpc = (int *)(v ^ (p-1))) - v);
       fpc = ((uint)xpc + 4096) & -4096;
@@ -236,7 +241,7 @@ next:
       }
     }
 
-    ir = *xpc++;
+    immediate = *xpc++;
 
     if (dbg) {
     again:
@@ -252,11 +257,11 @@ next:
       case 'i':
         printf(DBG_REG_CONTEX,
                a, b, c, xsp - tsp, (uint)xpc - tpc, f, g,
-               (user ? usp : ssp) - tsp, user, iena, trap, paging, ipend);
+               (user ? usp : ssp) - tsp, user, iena, trap, virtualMemoryEnabled, ipend);
         goto again;
       case 'x':
         if((sscanf(dbgbuf + 1, "%x", &u) != 1)
-           || (!(t = tr[u >> 12]) && !(t = rlook(u))))
+           || (!(t = currentReadPageTable[u >> 12]) && !(t = rlook(u))))
           printf("\ninvalid address: %s.\n", dbgbuf + 1);
         else
           printf("\n[%8.8x]: %2.2x\n", u, *((unsigned char *)(u ^ (t & -2))));
@@ -268,7 +273,7 @@ next:
       }
     }
 
-    switch ((uchar)ir) {
+    switch ((uchar)immediate) {
     case HALT: if (user || verbose) dprintf(2,"halt(%d) cycle = %u\n", a, cycle + (int)((uint)xpc - xcycle)/4); return; // XXX should be supervisor!
     case IDLE: if (user) { trap = FPRIV; break; }
       if (!iena) { trap = FINST; break; } // XXX this will be fatal !!!
@@ -298,8 +303,8 @@ next:
     // memory -- designed to be restartable/continuable after exception/interrupt
     case MCPY: // while (c) { *a = *b; a++; b++; c--; }
       while (c) {
-        if (!(t = tr[b >> 12]) && !(t = rlook(b))) goto exception;
-        if (!(p = tw[a >> 12]) && !(p = wlook(a))) goto exception;
+        if (!(t = currentReadPageTable[b >> 12]) && !(t = rlook(b))) goto exception;
+        if (!(p = currentWritePageTable[a >> 12]) && !(p = wlook(a))) goto exception;
         if ((v = 4096 - (a & 4095)) > c) v = c;
         if ((u = 4096 - (b & 4095)) > v) u = v;
         memcpy((char *)(a ^ (p & -2)), (char *)(b ^ (t & -2)), u);
@@ -311,8 +316,8 @@ next:
     case MCMP: // for (;;) { if (!c) { a = 0; break; } if (*b != *a) { a = *b - *a; b += c; c = 0; break; } a++; b++; c--; }
       for (;;) {
         if (!c) { a = 0; break; }
-        if (!(t = tr[b >> 12]) && !(t = rlook(b))) goto exception;
-        if (!(p = tr[a >> 12]) && !(p = rlook(a))) goto exception;
+        if (!(t = currentReadPageTable[b >> 12]) && !(t = rlook(b))) goto exception;
+        if (!(p = currentReadPageTable[a >> 12]) && !(p = rlook(a))) goto exception;
         if ((v = 4096 - (a & 4095)) > c) v = c;
         if ((u = 4096 - (b & 4095)) > v) u = v;
         if ((t = memcmp((char *)(a ^ (p & -2)), (char *)(b ^ (t & -2)), u))) { a = t; b += c; c = 0; break; }
@@ -324,7 +329,7 @@ next:
     case MCHR: // for (;;) { if (!c) { a = 0; break; } if (*a == b) { c = 0; break; } a++; c--; }
       for (;;) {
         if (!c) { a = 0; break; }
-        if (!(p = tr[a >> 12]) && !(p = rlook(a))) goto exception;
+        if (!(p = currentReadPageTable[a >> 12]) && !(p = rlook(a))) goto exception;
         if ((u = 4096 - (a & 4095)) > c) u = c;
         if ((t = (uint)memchr((char *)(v = a ^ (p & -2)), b, u))) { a += t - v; c = 0; break; }
         a += u; c -= u;
@@ -334,7 +339,7 @@ next:
 
     case MSET: // while (c) { *a = b; a++; c--; }
       while (c) {
-        if (!(p = tw[a >> 12]) && !(p = wlook(a))) goto exception;
+        if (!(p = currentWritePageTable[a >> 12]) && !(p = wlook(a))) goto exception;
         if ((u = 4096 - (a & 4095)) > c) u = c;
         memset((char *)(a ^ (p & -2)), b, u);
         a += u; c -= u;
@@ -364,146 +369,146 @@ next:
     case SQRT: f = sqrt(f); continue;
     case FMOD: f = fmod(f,g); continue;
 
-    case ENT:  if (fsp && (fsp -= ir & -256) > 4096<<8) fsp = 0; xsp += ir>>8; if (fsp) continue; goto fixsp;
-    case LEV:  if (ir < fsp) { t = *(uint *)(xsp + (ir>>8)) + tpc; fsp -= (ir + 0x800) & -256; } // XXX revisit this mess
-               else { if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; t = *(uint *)((v ^ p) & -8) + tpc; fsp = 0; }
-               xsp += (ir>>8) + 8; xcycle += t - (uint)xpc; if ((uint)(xpc = (int *)t) - fpc < -4096) goto fixpc; goto next;
+    case ENT:  if (fsp && (fsp -= immediate & -256) > 4096<<8) fsp = 0; xsp += immediate>>8; if (fsp) continue; goto fixsp;
+    case LEV:  if (immediate < fsp) { t = *(uint *)(xsp + (immediate>>8)) + tpc; fsp -= (immediate + 0x800) & -256; } // XXX revisit this mess
+               else { if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; t = *(uint *)((v ^ p) & -8) + tpc; fsp = 0; }
+               xsp += (immediate>>8) + 8; xcycle += t - (uint)xpc; if ((uint)(xpc = (int *)t) - fpc < -4096) goto fixpc; goto next;
 
     // jump
-    case JMP:  xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next;
-    case JMPI: if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8) + (a<<2)) >> 12]) && !(p = rlook(v))) break;
+    case JMP:  xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next;
+    case JMPI: if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8) + (a<<2)) >> 12]) && !(p = rlook(v))) break;
                xcycle += (t = *(uint *)((v ^ p) & -4)); if ((uint)(xpc = (int *)((uint)xpc + t)) - fpc < -4096) goto fixpc; goto next;
     case JSR:  if (fsp & (4095<<8)) { xsp -= 8; fsp += 8<<8; *(uint *)xsp = (uint)xpc - tpc; }
-               else { if (!(p = tw[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(uint *)((v ^ p) & -8) = (uint)xpc - tpc; fsp = 0; xsp -= 8; }
-               xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next;
+               else { if (!(p = currentWritePageTable[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(uint *)((v ^ p) & -8) = (uint)xpc - tpc; fsp = 0; xsp -= 8; }
+               xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next;
     case JSRA: if (fsp & (4095<<8)) { xsp -= 8; fsp += 8<<8; *(uint *)xsp = (uint)xpc - tpc; }
-               else { if (!(p = tw[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(uint *)((v ^ p) & -8) = (uint)xpc - tpc; fsp = 0; xsp -= 8; }
+               else { if (!(p = currentWritePageTable[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(uint *)((v ^ p) & -8) = (uint)xpc - tpc; fsp = 0; xsp -= 8; }
                xcycle += a + tpc - (uint)xpc; if ((uint)(xpc = (int *)(a + tpc)) - fpc < -4096) goto fixpc; goto next;
 
     // stack
     case PSHA: if (fsp & (4095<<8)) { xsp -= 8; fsp += 8<<8; *(uint *)xsp = a; continue; }
-               if (!(p = tw[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(uint *)   ((v ^ p) & -8) = a;     xsp -= 8; fsp = 0; goto fixsp;
+               if (!(p = currentWritePageTable[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(uint *)   ((v ^ p) & -8) = a;     xsp -= 8; fsp = 0; goto fixsp;
     case PSHB: if (fsp & (4095<<8)) { xsp -= 8; fsp += 8<<8; *(uint *)xsp = b; continue; }
-               if (!(p = tw[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(uint *)   ((v ^ p) & -8) = b;     xsp -= 8; fsp = 0; goto fixsp;
+               if (!(p = currentWritePageTable[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(uint *)   ((v ^ p) & -8) = b;     xsp -= 8; fsp = 0; goto fixsp;
     case PSHC: if (fsp & (4095<<8)) { xsp -= 8; fsp += 8<<8; *(uint *)xsp = c; continue; }
-               if (!(p = tw[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(uint *)   ((v ^ p) & -8) = c;     xsp -= 8; fsp = 0; goto fixsp;
+               if (!(p = currentWritePageTable[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(uint *)   ((v ^ p) & -8) = c;     xsp -= 8; fsp = 0; goto fixsp;
     case PSHF: if (fsp & (4095<<8)) { xsp -= 8; fsp += 8<<8; *(double *)xsp = f; continue; }
-               if (!(p = tw[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(double *) ((v ^ p) & -8) = f;     xsp -= 8; fsp = 0; goto fixsp;
+               if (!(p = currentWritePageTable[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(double *) ((v ^ p) & -8) = f;     xsp -= 8; fsp = 0; goto fixsp;
     case PSHG: if (fsp & (4095<<8)) { xsp -= 8; fsp += 8<<8; *(double *)xsp = g; continue; }
-               if (!(p = tw[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(double *) ((v ^ p) & -8) = g;     xsp -= 8; fsp = 0; goto fixsp;
-    case PSHI: if (fsp & (4095<<8)) { xsp -= 8; fsp += 8<<8; *(int *)xsp = ir>>8; continue; }
-               if (!(p = tw[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(int *)    ((v ^ p) & -8) = ir>>8; xsp -= 8; fsp = 0; goto fixsp;
+               if (!(p = currentWritePageTable[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(double *) ((v ^ p) & -8) = g;     xsp -= 8; fsp = 0; goto fixsp;
+    case PSHI: if (fsp & (4095<<8)) { xsp -= 8; fsp += 8<<8; *(int *)xsp = immediate>>8; continue; }
+               if (!(p = currentWritePageTable[(v = xsp - tsp - 8) >> 12]) && !(p = wlook(v))) break; *(int *)    ((v ^ p) & -8) = immediate>>8; xsp -= 8; fsp = 0; goto fixsp;
 
     case POPA: if (fsp) { a = *(uint *)xsp; xsp += 8; fsp -= 8<<8; continue; }
-               if (!(p = tr[(v = xsp - tsp) >> 12]) && !(p = rlook(v))) break; a = *(uint *)   ((v ^ p) & -8); xsp += 8; goto fixsp;
+               if (!(p = currentReadPageTable[(v = xsp - tsp) >> 12]) && !(p = rlook(v))) break; a = *(uint *)   ((v ^ p) & -8); xsp += 8; goto fixsp;
     case POPB: if (fsp) { b = *(uint *)xsp; xsp += 8; fsp -= 8<<8; continue; }
-               if (!(p = tr[(v = xsp - tsp) >> 12]) && !(p = rlook(v))) break; b = *(uint *)   ((v ^ p) & -8); xsp += 8; goto fixsp;
+               if (!(p = currentReadPageTable[(v = xsp - tsp) >> 12]) && !(p = rlook(v))) break; b = *(uint *)   ((v ^ p) & -8); xsp += 8; goto fixsp;
     case POPC: if (fsp) { c = *(uint *)xsp; xsp += 8; fsp -= 8<<8; continue; }
-               if (!(p = tr[(v = xsp - tsp) >> 12]) && !(p = rlook(v))) break; c = *(uint *)   ((v ^ p) & -8); xsp += 8; goto fixsp;
+               if (!(p = currentReadPageTable[(v = xsp - tsp) >> 12]) && !(p = rlook(v))) break; c = *(uint *)   ((v ^ p) & -8); xsp += 8; goto fixsp;
     case POPF: if (fsp) { f = *(double *)xsp; xsp += 8; fsp -= 8<<8; continue; }
-               if (!(p = tr[(v = xsp - tsp) >> 12]) && !(p = rlook(v))) break; f = *(double *) ((v ^ p) & -8); xsp += 8; goto fixsp;
+               if (!(p = currentReadPageTable[(v = xsp - tsp) >> 12]) && !(p = rlook(v))) break; f = *(double *) ((v ^ p) & -8); xsp += 8; goto fixsp;
     case POPG: if (fsp) { g = *(double *)xsp; xsp += 8; fsp -= 8<<8; continue; }
-               if (!(p = tr[(v = xsp - tsp) >> 12]) && !(p = rlook(v))) break; g = *(double *) ((v ^ p) & -8); xsp += 8; goto fixsp;
+               if (!(p = currentReadPageTable[(v = xsp - tsp) >> 12]) && !(p = rlook(v))) break; g = *(double *) ((v ^ p) & -8); xsp += 8; goto fixsp;
 
     // load effective address
-    case LEA:  a = xsp - tsp + (ir>>8); continue;
-    case LEAG: a = (uint)xpc - tpc + (ir>>8); continue;
+    case LEA:  a = xsp - tsp + (immediate>>8); continue;
+    case LEAG: a = (uint)xpc - tpc + (immediate>>8); continue;
 
     // load a local
-    case LL:   if (ir < fsp) { a = *(uint *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(uint *) ((v ^ p) & -4);
+    case LL:   if (immediate < fsp) { a = *(uint *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(uint *) ((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case LLS:  if (ir < fsp) { a = *(short *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(short *) ((v ^ p) & -2);
+    case LLS:  if (immediate < fsp) { a = *(short *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(short *) ((v ^ p) & -2);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case LLH:  if (ir < fsp) { a = *(ushort *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(ushort *) ((v ^ p) & -2);
+    case LLH:  if (immediate < fsp) { a = *(ushort *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(ushort *) ((v ^ p) & -2);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case LLC:  if (ir < fsp) { a = *(char *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(char *) (v ^ p & -2);
+    case LLC:  if (immediate < fsp) { a = *(char *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(char *) (v ^ p & -2);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case LLB:  if (ir < fsp) { a = *(uchar *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(uchar *) (v ^ p & -2);
+    case LLB:  if (immediate < fsp) { a = *(uchar *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(uchar *) (v ^ p & -2);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case LLD:  if (ir < fsp) { f = *(double *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; f = *(double *) ((v ^ p) & -8);
+    case LLD:  if (immediate < fsp) { f = *(double *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; f = *(double *) ((v ^ p) & -8);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case LLF:  if (ir < fsp) { f = *(float *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; f = *(float *)  ((v ^ p) & -4);
+    case LLF:  if (immediate < fsp) { f = *(float *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; f = *(float *)  ((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     // load a global
-    case LG:   if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(uint *)   ((v ^ p) & -4); continue;
-    case LGS:  if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(short *)  ((v ^ p) & -2); continue;
-    case LGH:  if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(ushort *) ((v ^ p) & -2); continue;
-    case LGC:  if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(char *)   (v ^ p & -2); continue;
-    case LGB:  if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(uchar *)  (v ^ p & -2); continue;
-    case LGD:  if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; f = *(double *) ((v ^ p) & -8); continue;
-    case LGF:  if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; f = *(float *)  ((v ^ p) & -4); continue;
+    case LG:   if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(uint *)   ((v ^ p) & -4); continue;
+    case LGS:  if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(short *)  ((v ^ p) & -2); continue;
+    case LGH:  if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(ushort *) ((v ^ p) & -2); continue;
+    case LGC:  if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(char *)   (v ^ p & -2); continue;
+    case LGB:  if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(uchar *)  (v ^ p & -2); continue;
+    case LGD:  if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; f = *(double *) ((v ^ p) & -8); continue;
+    case LGF:  if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; f = *(float *)  ((v ^ p) & -4); continue;
 
     // load a indexed
-    case LX:   if (!(p = tr[(v = a + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(uint *)   ((v ^ p) & -4); continue;
-    case LXS:  if (!(p = tr[(v = a + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(short *)  ((v ^ p) & -2); continue;
-    case LXH:  if (!(p = tr[(v = a + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(ushort *) ((v ^ p) & -2); continue;
-    case LXC:  if (!(p = tr[(v = a + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(char *)   (v ^ p & -2); continue;
-    case LXB:  if (!(p = tr[(v = a + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = *(uchar *)  (v ^ p & -2); continue;
-    case LXD:  if (!(p = tr[(v = a + (ir>>8)) >> 12]) && !(p = rlook(v))) break; f = *(double *) ((v ^ p) & -8); continue;
-    case LXF:  if (!(p = tr[(v = a + (ir>>8)) >> 12]) && !(p = rlook(v))) break; f = *(float *)  ((v ^ p) & -4); continue;
+    case LX:   if (!(p = currentReadPageTable[(v = a + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(uint *)   ((v ^ p) & -4); continue;
+    case LXS:  if (!(p = currentReadPageTable[(v = a + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(short *)  ((v ^ p) & -2); continue;
+    case LXH:  if (!(p = currentReadPageTable[(v = a + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(ushort *) ((v ^ p) & -2); continue;
+    case LXC:  if (!(p = currentReadPageTable[(v = a + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(char *)   (v ^ p & -2); continue;
+    case LXB:  if (!(p = currentReadPageTable[(v = a + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = *(uchar *)  (v ^ p & -2); continue;
+    case LXD:  if (!(p = currentReadPageTable[(v = a + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; f = *(double *) ((v ^ p) & -8); continue;
+    case LXF:  if (!(p = currentReadPageTable[(v = a + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; f = *(float *)  ((v ^ p) & -4); continue;
 
     // load a immediate
-    case LI:   a = ir>>8; continue;
-    case LHI:  a = a<<24 | (uint)ir>>8; continue;
-    case LIF:  f = (ir>>8)/256.0; continue;
+    case LI:   a = immediate>>8; continue;
+    case LHI:  a = a<<24 | (uint)immediate>>8; continue;
+    case LIF:  f = (immediate>>8)/256.0; continue;
 
     // load b local
-    case LBL:  if (ir < fsp) { b = *(uint *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(uint *) ((v ^ p) & -4);
+    case LBL:  if (immediate < fsp) { b = *(uint *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(uint *) ((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case LBLS: if (ir < fsp) { b = *(short *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(short *)  ((v ^ p) & -2);
+    case LBLS: if (immediate < fsp) { b = *(short *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(short *)  ((v ^ p) & -2);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case LBLH: if (ir < fsp) { b = *(ushort *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(ushort *) ((v ^ p) & -2);
+    case LBLH: if (immediate < fsp) { b = *(ushort *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(ushort *) ((v ^ p) & -2);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case LBLC: if (ir < fsp) { b = *(char *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(char *)  (v ^ p & -2);
+    case LBLC: if (immediate < fsp) { b = *(char *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(char *)  (v ^ p & -2);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case LBLB: if (ir < fsp) { b = *(uchar *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(uchar *)  (v ^ p & -2);
+    case LBLB: if (immediate < fsp) { b = *(uchar *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(uchar *)  (v ^ p & -2);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case LBLD: if (ir < fsp) { g = *(double *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; g = *(double *) ((v ^ p) & -8);
+    case LBLD: if (immediate < fsp) { g = *(double *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; g = *(double *) ((v ^ p) & -8);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case LBLF: if (ir < fsp) { g = *(float *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; g = *(float *)  ((v ^ p) & -4);
+    case LBLF: if (immediate < fsp) { g = *(float *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; g = *(float *)  ((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     // load b global
-    case LBG:  if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(uint *)   ((v ^ p) & -4); continue;
-    case LBGS: if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(short *)  ((v ^ p) & -2); continue;
-    case LBGH: if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(ushort *) ((v ^ p) & -2); continue;
-    case LBGC: if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(char *)   (v ^ p & -2); continue;
-    case LBGB: if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(uchar *)  (v ^ p & -2); continue;
-    case LBGD: if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; g = *(double *) ((v ^ p) & -8); continue;
-    case LBGF: if (!(p = tr[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = rlook(v))) break; g = *(float *)  ((v ^ p) & -4); continue;
+    case LBG:  if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(uint *)   ((v ^ p) & -4); continue;
+    case LBGS: if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(short *)  ((v ^ p) & -2); continue;
+    case LBGH: if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(ushort *) ((v ^ p) & -2); continue;
+    case LBGC: if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(char *)   (v ^ p & -2); continue;
+    case LBGB: if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(uchar *)  (v ^ p & -2); continue;
+    case LBGD: if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; g = *(double *) ((v ^ p) & -8); continue;
+    case LBGF: if (!(p = currentReadPageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; g = *(float *)  ((v ^ p) & -4); continue;
 
     // load b indexed
-    case LBX:  if (!(p = tr[(v = b + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(uint *)   ((v ^ p) & -4); continue;
-    case LBXS: if (!(p = tr[(v = b + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(short *)  ((v ^ p) & -2); continue;
-    case LBXH: if (!(p = tr[(v = b + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(ushort *) ((v ^ p) & -2); continue;
-    case LBXC: if (!(p = tr[(v = b + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(char *)   (v ^ p & -2); continue;
-    case LBXB: if (!(p = tr[(v = b + (ir>>8)) >> 12]) && !(p = rlook(v))) break; b = *(uchar *)  (v ^ p & -2); continue;
-    case LBXD: if (!(p = tr[(v = b + (ir>>8)) >> 12]) && !(p = rlook(v))) break; g = *(double *) ((v ^ p) & -8); continue;
-    case LBXF: if (!(p = tr[(v = b + (ir>>8)) >> 12]) && !(p = rlook(v))) break; g = *(float *)  ((v ^ p) & -4); continue;
+    case LBX:  if (!(p = currentReadPageTable[(v = b + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(uint *)   ((v ^ p) & -4); continue;
+    case LBXS: if (!(p = currentReadPageTable[(v = b + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(short *)  ((v ^ p) & -2); continue;
+    case LBXH: if (!(p = currentReadPageTable[(v = b + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(ushort *) ((v ^ p) & -2); continue;
+    case LBXC: if (!(p = currentReadPageTable[(v = b + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(char *)   (v ^ p & -2); continue;
+    case LBXB: if (!(p = currentReadPageTable[(v = b + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; b = *(uchar *)  (v ^ p & -2); continue;
+    case LBXD: if (!(p = currentReadPageTable[(v = b + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; g = *(double *) ((v ^ p) & -8); continue;
+    case LBXF: if (!(p = currentReadPageTable[(v = b + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; g = *(float *)  ((v ^ p) & -4); continue;
 
     // load b immediate
-    case LBI:  b = ir>>8; continue;
-    case LBHI: b = b<<24 | (uint)ir>>8; continue;
-    case LBIF: g = (ir>>8)/256.0; continue;
+    case LBI:  b = immediate>>8; continue;
+    case LBHI: b = b<<24 | (uint)immediate>>8; continue;
+    case LBIF: g = (immediate>>8)/256.0; continue;
 
     // misc transfer
-    case LCL:  if (ir < fsp) { c = *(uint *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; c = *(uint *) ((v ^ p) & -4);
+    case LCL:  if (immediate < fsp) { c = *(uint *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; c = *(uint *) ((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     case LBA:  b = a; continue;  // XXX need LAB, LAC to improve k.c  // or maybe a = a * imm + b ?  or b = b * imm + a ?
@@ -511,35 +516,35 @@ next:
     case LBAD: g = f; continue;
 
     // store a local
-    case SL:   if (ir < fsp) { *(uint *)(xsp + (ir>>8)) = a; continue; }
-               if (!(p = tw[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(uint *) ((v ^ p) & -4) = a;
+    case SL:   if (immediate < fsp) { *(uint *)(xsp + (immediate>>8)) = a; continue; }
+               if (!(p = currentWritePageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(uint *) ((v ^ p) & -4) = a;
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case SLH:  if (ir < fsp) { *(ushort *)(xsp + (ir>>8)) = a; continue; }
-               if (!(p = tw[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(ushort *) ((v ^ p) & -2) = a;
+    case SLH:  if (immediate < fsp) { *(ushort *)(xsp + (immediate>>8)) = a; continue; }
+               if (!(p = currentWritePageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(ushort *) ((v ^ p) & -2) = a;
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case SLB:  if (ir < fsp) { *(uchar *)(xsp + (ir>>8)) = a; continue; }
-               if (!(p = tw[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(uchar *) (v ^ p & -2) = a;
+    case SLB:  if (immediate < fsp) { *(uchar *)(xsp + (immediate>>8)) = a; continue; }
+               if (!(p = currentWritePageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(uchar *) (v ^ p & -2) = a;
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case SLD:  if (ir < fsp) { *(double *)(xsp + (ir>>8)) = f; continue; }
-               if (!(p = tw[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(double *) ((v ^ p) & -8) = f;
+    case SLD:  if (immediate < fsp) { *(double *)(xsp + (immediate>>8)) = f; continue; }
+               if (!(p = currentWritePageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(double *) ((v ^ p) & -8) = f;
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
-    case SLF:  if (ir < fsp) { *(float *)(xsp + (ir>>8)) = f; continue; }
-               if (!(p = tw[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(float *) ((v ^ p) & -4) = f;
+    case SLF:  if (immediate < fsp) { *(float *)(xsp + (immediate>>8)) = f; continue; }
+               if (!(p = currentWritePageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(float *) ((v ^ p) & -4) = f;
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     // store a global
-    case SG:   if (!(p = tw[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(uint *)   ((v ^ p) & -4) = a; continue;
-    case SGH:  if (!(p = tw[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(ushort *) ((v ^ p) & -2) = a; continue;
-    case SGB:  if (!(p = tw[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(uchar *)  (v ^ p & -2)   = a; continue;
-    case SGD:  if (!(p = tw[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(double *) ((v ^ p) & -8) = f; continue;
-    case SGF:  if (!(p = tw[(v = (uint)xpc - tpc + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(float *)  ((v ^ p) & -4) = f; continue;
+    case SG:   if (!(p = currentWritePageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(uint *)   ((v ^ p) & -4) = a; continue;
+    case SGH:  if (!(p = currentWritePageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(ushort *) ((v ^ p) & -2) = a; continue;
+    case SGB:  if (!(p = currentWritePageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(uchar *)  (v ^ p & -2)   = a; continue;
+    case SGD:  if (!(p = currentWritePageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(double *) ((v ^ p) & -8) = f; continue;
+    case SGF:  if (!(p = currentWritePageTable[(v = (uint)xpc - tpc + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(float *)  ((v ^ p) & -4) = f; continue;
 
     // store a indexed
-    case SX:   if (!(p = tw[(v = b + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(uint *)   ((v ^ p) & -4) = a; continue;
-    case SXH:  if (!(p = tw[(v = b + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(ushort *) ((v ^ p) & -2) = a; continue;
-    case SXB:  if (!(p = tw[(v = b + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(uchar *)  (v ^ p & -2)   = a; continue;
-    case SXD:  if (!(p = tw[(v = b + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(double *) ((v ^ p) & -8) = f; continue;
-    case SXF:  if (!(p = tw[(v = b + (ir>>8)) >> 12]) && !(p = wlook(v))) break; *(float *)  ((v ^ p) & -4) = f; continue;
+    case SX:   if (!(p = currentWritePageTable[(v = b + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(uint *)   ((v ^ p) & -4) = a; continue;
+    case SXH:  if (!(p = currentWritePageTable[(v = b + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(ushort *) ((v ^ p) & -2) = a; continue;
+    case SXB:  if (!(p = currentWritePageTable[(v = b + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(uchar *)  (v ^ p & -2)   = a; continue;
+    case SXD:  if (!(p = currentWritePageTable[(v = b + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(double *) ((v ^ p) & -8) = f; continue;
+    case SXF:  if (!(p = currentWritePageTable[(v = b + (immediate>>8)) >> 12]) && !(p = wlook(v))) break; *(float *)  ((v ^ p) & -4) = f; continue;
 
     // arithmetic
     case ADDF: f += g; continue;
@@ -548,81 +553,81 @@ next:
     case DIVF: if (g == 0.0) { trap = FARITH; break; } f /= g; continue; // XXX
 
     case ADD:  a += b; continue;
-    case ADDI: a += ir>>8; continue;
-    case ADDL: if (ir < fsp) { a += *(uint *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a += *(uint *)((v ^ p) & -4);
+    case ADDI: a += immediate>>8; continue;
+    case ADDL: if (immediate < fsp) { a += *(uint *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a += *(uint *)((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     case SUB:  a -= b; continue;
-    case SUBI: a -= ir>>8; continue;
-    case SUBL: if (ir < fsp) { a -= *(uint *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a -= *(uint *)((v ^ p) & -4);
+    case SUBI: a -= immediate>>8; continue;
+    case SUBL: if (immediate < fsp) { a -= *(uint *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a -= *(uint *)((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     case MUL:  a = (int)a * (int)b; continue; // XXX MLU ???
-    case MULI: a = (int)a * (ir>>8); continue;
-    case MULL: if (ir < fsp) { a = (int)a * *(int *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = (int)a * *(int *)((v ^ p) & -4);
+    case MULI: a = (int)a * (immediate>>8); continue;
+    case MULL: if (immediate < fsp) { a = (int)a * *(int *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = (int)a * *(int *)((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     case DIV:  if (!b) { trap = FARITH; break; } a = (int)a / (int)b; continue;
-    case DIVI: if (!(t = ir>>8)) { trap = FARITH; break; } a = (int)a / (int)t; continue;
-    case DIVL: if (ir < fsp) { if (!(t = *(uint *)(xsp + (ir>>8)))) { trap = FARITH; break; } a = (int)a / (int)t; continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; if (!(t = *(uint *)((v ^ p) & -4))) { trap = FARITH; break; } a = (int)a / (int)t;
+    case DIVI: if (!(t = immediate>>8)) { trap = FARITH; break; } a = (int)a / (int)t; continue;
+    case DIVL: if (immediate < fsp) { if (!(t = *(uint *)(xsp + (immediate>>8)))) { trap = FARITH; break; } a = (int)a / (int)t; continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; if (!(t = *(uint *)((v ^ p) & -4))) { trap = FARITH; break; } a = (int)a / (int)t;
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     case DVU:  if (!b) { trap = FARITH; break; } a /= b; continue;
-    case DVUI: if (!(t = ir>>8)) { trap = FARITH; break; } a /= t; continue;
-    case DVUL: if (ir < fsp) { if (!(t = *(int *)(xsp + (ir>>8)))) { trap = FARITH; break; } a /= t; continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; if (!(t = *(uint *)((v ^ p) & -4))) { trap = FARITH; break; } a /= t;
+    case DVUI: if (!(t = immediate>>8)) { trap = FARITH; break; } a /= t; continue;
+    case DVUL: if (immediate < fsp) { if (!(t = *(int *)(xsp + (immediate>>8)))) { trap = FARITH; break; } a /= t; continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; if (!(t = *(uint *)((v ^ p) & -4))) { trap = FARITH; break; } a /= t;
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     case MOD:  a = (int)a % (int)b; continue;
-    case MODI: a = (int)a % (ir>>8); continue;
-    case MODL: if (ir < fsp) { a = (int)a % *(int *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = (int)a % *(int *)((v ^ p) & -4);
+    case MODI: a = (int)a % (immediate>>8); continue;
+    case MODL: if (immediate < fsp) { a = (int)a % *(int *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = (int)a % *(int *)((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     case MDU:  a %= b; continue;
-    case MDUI: a %= (ir>>8); continue;
-    case MDUL: if (ir < fsp) { a %= *(uint *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a %= *(uint *)((v ^ p) & -4);
+    case MDUI: a %= (immediate>>8); continue;
+    case MDUL: if (immediate < fsp) { a %= *(uint *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a %= *(uint *)((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     case AND:  a &= b; continue;
-    case ANDI: a &= ir>>8; continue;
-    case ANDL: if (ir < fsp) { a &= *(uint *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a &= *(uint *)((v ^ p) & -4);
+    case ANDI: a &= immediate>>8; continue;
+    case ANDL: if (immediate < fsp) { a &= *(uint *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a &= *(uint *)((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     case OR:   a |= b; continue;
-    case ORI:  a |= ir>>8; continue;
-    case ORL:  if (ir < fsp) { a |= *(uint *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a |= *(uint *)((v ^ p) & -4);
+    case ORI:  a |= immediate>>8; continue;
+    case ORL:  if (immediate < fsp) { a |= *(uint *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a |= *(uint *)((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     case XOR:  a ^= b; continue;
-    case XORI: a ^= ir>>8; continue;
-    case XORL: if (ir < fsp) { a ^= *(uint *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a ^= *(uint *)((v ^ p) & -4);
+    case XORI: a ^= immediate>>8; continue;
+    case XORL: if (immediate < fsp) { a ^= *(uint *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a ^= *(uint *)((v ^ p) & -4);
                if ((fsp || (v ^ (xsp - tsp)) & -4096)) continue; goto fixsp;
 
     case SHL:  a <<= b; continue;
-    case SHLI: a <<= ir>>8; continue;
-    case SHLL: if (ir < fsp) { a <<= *(uint *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a <<= *(uint *)((v ^ p) & -4);
+    case SHLI: a <<= immediate>>8; continue;
+    case SHLL: if (immediate < fsp) { a <<= *(uint *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a <<= *(uint *)((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     case SHR:  a = (int)a >> (int)b; continue;
-    case SHRI: a = (int)a >> (ir>>8); continue;
-    case SHRL: if (ir < fsp) { a = (int)a >> *(int *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a = (int)a >> *(int *)((v ^ p) & -4);
+    case SHRI: a = (int)a >> (immediate>>8); continue;
+    case SHRL: if (immediate < fsp) { a = (int)a >> *(int *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a = (int)a >> *(int *)((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     case SRU:  a >>= b; continue;
-    case SRUI: a >>= ir>>8; continue;
-    case SRUL: if (ir < fsp) { a >>= *(uint *)(xsp + (ir>>8)); continue; }
-               if (!(p = tr[(v = xsp - tsp + (ir>>8)) >> 12]) && !(p = rlook(v))) break; a >>= *(uint *)((v ^ p) & -4);
+    case SRUI: a >>= immediate>>8; continue;
+    case SRUL: if (immediate < fsp) { a >>= *(uint *)(xsp + (immediate>>8)); continue; }
+               if (!(p = currentReadPageTable[(v = xsp - tsp + (immediate>>8)) >> 12]) && !(p = rlook(v))) break; a >>= *(uint *)((v ^ p) & -4);
                if (fsp || (v ^ (xsp - tsp)) & -4096) continue; goto fixsp;
 
     // logical
@@ -638,20 +643,20 @@ next:
     case GEF:  a = f >= g; continue;
 
     // branch
-    case BZ:   if (!a)               { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
-    case BZF:  if (!f)               { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
-    case BNZ:  if (a)                { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
-    case BNZF: if (f)                { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
-    case BE:   if (a == b)           { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
-    case BEF:  if (f == g)           { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
-    case BNE:  if (a != b)           { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
-    case BNEF: if (f != g)           { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
-    case BLT:  if ((int)a < (int)b)  { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
-    case BLTU: if (a < b)            { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
-    case BLTF: if (f <  g)           { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
-    case BGE:  if ((int)a >= (int)b) { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
-    case BGEU: if (a >= b)           { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
-    case BGEF: if (f >= g)           { xcycle += ir>>8; if ((uint)(xpc += ir>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BZ:   if (!a)               { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BZF:  if (!f)               { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BNZ:  if (a)                { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BNZF: if (f)                { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BE:   if (a == b)           { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BEF:  if (f == g)           { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BNE:  if (a != b)           { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BNEF: if (f != g)           { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BLT:  if ((int)a < (int)b)  { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BLTU: if (a < b)            { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BLTF: if (f <  g)           { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BGE:  if ((int)a >= (int)b) { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BGEU: if (a >= b)           { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
+    case BGEF: if (f >= g)           { xcycle += immediate>>8; if ((uint)(xpc += immediate>>10) - fpc < -4096) goto fixpc; goto next; } continue;
 
     // conversion
     case CID:  f = (int)a; continue;
@@ -674,21 +679,21 @@ next:
     case RTI:
       if (user) { trap = FPRIV; break; }
       xsp -= tsp; tsp = fsp = 0;
-      if (!(p = tr[xsp >> 12]) && !(p = rlook(xsp))) { dprintf(2,"RTI kstack fault\n"); goto fatal; }
+      if (!(p = currentReadPageTable[xsp >> 12]) && !(p = rlook(xsp))) { dprintf(2,"RTI kstack fault\n"); goto fatal; }
       t = *(uint *)((xsp ^ p) & -8); xsp += 8;
-      if (!(p = tr[xsp >> 12]) && !(p = rlook(xsp))) { dprintf(2,"RTI kstack fault\n"); goto fatal; }
+      if (!(p = currentReadPageTable[xsp >> 12]) && !(p = rlook(xsp))) { dprintf(2,"RTI kstack fault\n"); goto fatal; }
       xcycle += (pc = *(uint *)((xsp ^ p) & -8) + tpc) - (uint)xpc; xsp += 8;
       xpc = (int *)pc;
-      if (t & USER) { ssp = xsp; xsp = usp; user = 1; tr = tru; tw = twu; }
+      if (t & USER) { ssp = xsp; xsp = usp; user = 1; currentReadPageTable = userReadPageTable; currentWritePageTable = userWritePageTable; }
       if (!iena) { if (ipend) { trap = ipend & -ipend; ipend ^= trap; goto interrupt; } iena = 1; }
       goto fixpc; // page may be invalid
 
     case IVEC: if (user) { trap = FPRIV; break; } ivec = a; continue;
-    case PDIR: if (user) { trap = FPRIV; break; } if (a > memsz) { trap = FMEM; break; } pdir = (mem + a) & -4096; flush(); fsp = 0; goto fixpc; // set page directory
-    case SPAG: if (user) { trap = FPRIV; break; } if (a && !pdir) { trap = FMEM; break; } paging = a; flush(); fsp = 0; goto fixpc; // enable paging
+    case PDIR: if (user) { trap = FPRIV; break; } if (a > memsz) { trap = FMEM; break; } pageDirectory = (mem + a) & -4096; flush(); fsp = 0; goto fixpc; // set page directory
+    case SPAG: if (user) { trap = FPRIV; break; } if (a && !pageDirectory) { trap = FMEM; break; } virtualMemoryEnabled = a; flush(); fsp = 0; goto fixpc; // enable paging
 
     case TIME: if (user) { trap = FPRIV; break; }
-       if (ir>>8) { dprintf(2,"timer%d=%u timeout=%u\n", ir>>8, timer, timeout); continue; }    // XXX undocumented feature!
+       if (immediate>>8) { dprintf(2,"timer%d=%u timeout=%u\n", immediate>>8, timer, timeout); continue; }    // XXX undocumented feature!
        timeout = a; continue; // XXX cancel pending interrupts if disabled?
 
     // XXX need some sort of user mode thread locking functions to support user mode semaphores, etc.  atomic test/set?
@@ -706,17 +711,17 @@ exception:
     if (!iena) { dprintf(2,"exception in interrupt handler\n"); goto fatal; }
 interrupt:
     xsp -= tsp; tsp = fsp = 0;
-    if (user) { usp = xsp; xsp = ssp; user = 0; tr = trk; tw = twk; trap |= USER; }
-    xsp -= 8; if (!(p = tw[xsp >> 12]) && !(p = wlook(xsp))) { dprintf(2,"kstack fault!\n"); goto fatal; }
+    if (user) { usp = xsp; xsp = ssp; user = 0; currentReadPageTable = kernelReadPageTable; currentWritePageTable = kernelWritePageTable; trap |= USER; }
+    xsp -= 8; if (!(p = currentWritePageTable[xsp >> 12]) && !(p = wlook(xsp))) { dprintf(2,"kstack fault!\n"); goto fatal; }
     *(uint *)((xsp ^ p) & -8) = (uint)xpc - tpc;
-    xsp -= 8; if (!(p = tw[xsp >> 12]) && !(p = wlook(xsp))) { dprintf(2,"kstack fault\n"); goto fatal; }
+    xsp -= 8; if (!(p = currentWritePageTable[xsp >> 12]) && !(p = wlook(xsp))) { dprintf(2,"kstack fault\n"); goto fatal; }
     *(uint *)((xsp ^ p) & -8) = trap;
     xcycle += ivec + tpc - (uint)xpc;
     xpc = (int *)(ivec + tpc);
     goto fixpc;
   }
 fatal:
-  dprintf(2,"processor halted! cycle = %u pc = %08x ir = %08x sp = %08x a = %d b = %d c = %d trap = %u\n", cycle + (int)((uint)xpc - xcycle)/4, (uint)xpc - tpc, ir, xsp - tsp, a, b, c, trap);
+  dprintf(2,"processor halted! cycle = %u pc = %08x ir = %08x sp = %08x a = %d b = %d c = %d trap = %u\n", cycle + (int)((uint)xpc - xcycle)/4, (uint)xpc - tpc, immediate, xsp - tsp, a, b, c, trap);
 }
 
 void usage()
@@ -774,12 +779,12 @@ int main(int argc, char *argv[])
 //  if (verbose) dprintf(2,"entry = %u text = %u data = %u bss = %u\n", hdr.entry, hdr.text, hdr.data, hdr.bss);
 
   // setup virtual memory
-  trk = (uint *) new(TB_SZ * sizeof(uint)); // kernel read table
-  twk = (uint *) new(TB_SZ * sizeof(uint)); // kernel write table
-  tru = (uint *) new(TB_SZ * sizeof(uint)); // user read table
-  twu = (uint *) new(TB_SZ * sizeof(uint)); // user write table
-  tr = trk;
-  tw = twk;
+  kernelReadPageTable = (uint *) new(TB_SZ * sizeof(uint)); // kernel read table
+  kernelWritePageTable = (uint *) new(TB_SZ * sizeof(uint)); // kernel write table
+  userReadPageTable = (uint *) new(TB_SZ * sizeof(uint)); // user read table
+  userWritePageTable = (uint *) new(TB_SZ * sizeof(uint)); // user write table
+  currentReadPageTable = kernelReadPageTable;
+  currentWritePageTable = kernelWritePageTable;
 
   if (verbose) dprintf(2,"%s : emulating %s\n", cmd, file);
   cpu(hdr.entry, memsz - FS_SZ);
