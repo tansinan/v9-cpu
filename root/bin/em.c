@@ -41,7 +41,7 @@ enum {           // processor fault codes (some can be masked together)
 };
 
 uint verbose,    // chatty option -v
-  mem, memsz,    // physical memory
+  memory, memorySize,    // physical memory
   user,          // user mode
   iena,          // interrupt enable
   ipend,         // interrupt pending
@@ -81,8 +81,8 @@ void flush()
 
 uint setpage(uint v, uint p, uint writable, uint userable)
 {
-  if (p >= memsz) { trap = FMEM; vadr = v; return 0; }
-  p = ((v ^ (mem + p)) & -4096) + 1;
+  if (p >= memorySize) { trap = FMEM; vadr = v; return 0; }
+  p = ((v ^ (memory + p)) & -4096) + 1;
   if (!kernelReadPageTable[v >>= 12]) {
     if (tpages >= TPAGES) flush();
     tpage[tpages++] = v;
@@ -103,8 +103,8 @@ uint rlook(uint v)
   pde = *(ppde = (uint *)(pageDirectory + (v>>22<<2))); // page directory entry
   if (pde & PTE_P) {
     if (!(pde & PTE_A)) *ppde = pde | PTE_A;
-    if (pde >= memsz) { trap = FMEM; vadr = v; return 0; }
-    pte = *(ppte = (uint *)(mem + (pde & -4096) + ((v >> 10) & 0xffc))); // page table entry
+    if (pde >= memorySize) { trap = FMEM; vadr = v; return 0; }
+    pte = *(ppte = (uint *)(memory + (pde & -4096) + ((v >> 10) & 0xffc))); // page table entry
     if ((pte & PTE_P) && ((userable = (q = pte & pde) & PTE_U) || !user)) {
       if (!(pte & PTE_A)) *ppte = pte | PTE_A;
       return setpage(v, pte, (pte & PTE_D) && (q & PTE_W), userable); // set writable after first write so dirty gets set
@@ -123,8 +123,8 @@ uint wlook(uint v)
   pde = *(ppde = (uint *)(pageDirectory + (v>>22<<2))); // page directory entry
   if (pde & PTE_P) {
     if (!(pde & PTE_A)) *ppde = pde | PTE_A;
-    if (pde >= memsz) { trap = FMEM; vadr = v; return 0; }
-    pte = *(ppte = (uint *)(mem + (pde & -4096) + ((v >> 10) & 0xffc)));  // page table entry
+    if (pde >= memorySize) { trap = FMEM; vadr = v; return 0; }
+    pte = *(ppte = (uint *)(memory + (pde & -4096) + ((v >> 10) & 0xffc)));  // page table entry
     if ((pte & PTE_P) && (((userable = (q = pte & pde) & PTE_U) || !user) && (q & PTE_W))) {
       if ((pte & (PTE_D | PTE_A)) != (PTE_D | PTE_A)) *ppte = pte | (PTE_D | PTE_A);
       return setpage(v, pte, q & PTE_W, userable);
@@ -145,7 +145,7 @@ static char dbg_getcmd(char *buf)
   fflush(stdin);
   fflush(stderr);
 
-  do { 
+  do {
     c = getchar();
     putchar(c);
     if (c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != EOF)
@@ -671,7 +671,7 @@ next:
 
     case NOP:  continue;
     case CYC:  a = cycle + (int)((uint)xpc - xcycle)/4; continue; // XXX protected?  XXX also need wall clock time instruction
-    case MSIZ: if (user) { trap = FPRIV; break; } a = memsz; continue;
+    case MSIZ: if (user) { trap = FPRIV; break; } a = memorySize; continue;
 
     case CLI:  if (user) { trap = FPRIV; break; } a = iena; iena = 0; continue;
     case STI:  if (user) { trap = FPRIV; break; } if (ipend) { trap = ipend & -ipend; ipend ^= trap; iena = 0; goto interrupt; } iena = 1; continue;
@@ -689,7 +689,7 @@ next:
       goto fixpc; // page may be invalid
 
     case IVEC: if (user) { trap = FPRIV; break; } ivec = a; continue;
-    case PDIR: if (user) { trap = FPRIV; break; } if (a > memsz) { trap = FMEM; break; } pageDirectory = (mem + a) & -4096; flush(); fsp = 0; goto fixpc; // set page directory
+    case PDIR: if (user) { trap = FPRIV; break; } if (a > memorySize) { trap = FMEM; break; } pageDirectory = (memory + a) & -4096; flush(); fsp = 0; goto fixpc; // set page directory
     case SPAG: if (user) { trap = FPRIV; break; } if (a && !pageDirectory) { trap = FMEM; break; } virtualMemoryEnabled = a; flush(); fsp = 0; goto fixpc; // enable paging
 
     case TIME: if (user) { trap = FPRIV; break; }
@@ -740,7 +740,7 @@ int main(int argc, char *argv[])
   cmd = *argv++;
   if (argc < 2) usage();
   file = *argv;
-  memsz = MEM_SZ;
+  memorySize = MEM_SZ;
   fs = 0;
   dbg = 0;
   verbose = 0;
@@ -748,7 +748,7 @@ int main(int argc, char *argv[])
     switch(file[1]) {
     case 'g': dbg = 1; break;
     case 'v': verbose = 1; break;
-    case 'm': memsz = atoi(*++argv) * (1024 * 1024); argc--; break;
+    case 'm': memorySize = atoi(*++argv) * (1024 * 1024); argc--; break;
     case 'f': fs = *++argv; argc--; break;
     default: usage();
     }
@@ -756,14 +756,14 @@ int main(int argc, char *argv[])
   }
 
   if (dbg) dprintf(2,"in debuger mode\n");
-  if (verbose) dprintf(2,"mem size = %u\n",memsz);
-  mem = (((int) new(memsz + 4096)) + 4095) & -4096;
+  if (verbose) dprintf(2,"mem size = %u\n",memorySize);
+  memory = (((int) new(memorySize + 4096)) + 4095) & -4096;
 
   if (fs) {
     if (verbose) dprintf(2,"%s : loading ram file system %s\n", cmd, fs);
     if ((f = open(fs, O_RDONLY)) < 0) { dprintf(2,"%s : couldn't open file system %s\n", cmd, fs); return -1; }
     if (fstat(f, &st)) { dprintf(2,"%s : couldn't stat file system %s\n", cmd, fs); return -1; }
-    if ((i = read(f, (void*)(mem + memsz - FS_SZ), st.st_size)) != st.st_size) { dprintf(2,"%s : failed to read filesystem size %d returned %d\n", cmd, st.st_size, i); return -1; }
+    if ((i = read(f, (void*)(memory + memorySize - FS_SZ), st.st_size)) != st.st_size) { dprintf(2,"%s : failed to read filesystem size %d returned %d\n", cmd, st.st_size, i); return -1; }
     close(f);
   }
 
@@ -773,7 +773,7 @@ int main(int argc, char *argv[])
   read(f, &hdr, sizeof(hdr));
   if (hdr.magic != 0xC0DEF00D) { dprintf(2,"%s : bad hdr.magic\n", cmd); return -1; }
 
-  if (read(f, (void*)mem, st.st_size - sizeof(hdr)) != st.st_size - sizeof(hdr)) { dprintf(2,"%s : failed to read file %sn", cmd, file); return -1; }
+  if (read(f, (void*)memory, st.st_size - sizeof(hdr)) != st.st_size - sizeof(hdr)) { dprintf(2,"%s : failed to read file %sn", cmd, file); return -1; }
   close(f);
 
 //  if (verbose) dprintf(2,"entry = %u text = %u data = %u bss = %u\n", hdr.entry, hdr.text, hdr.data, hdr.bss);
@@ -787,6 +787,6 @@ int main(int argc, char *argv[])
   currentWritePageTable = kernelWritePageTable;
 
   if (verbose) dprintf(2,"%s : emulating %s\n", cmd, file);
-  cpu(hdr.entry, memsz - FS_SZ);
+  cpu(hdr.entry, memorySize - FS_SZ);
   return 0;
 }
